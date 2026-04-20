@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Feishu custom app creation workflow - V25 Fast
+Feishu custom app creation workflow - V26 Fast
 
 A speed-optimized version for stable networks and fast machines.
 Reliability is preserved through per-step verification and retry loops,
 but timing constants are tightened to minimize wall-clock time.
 
-Typical execution: ~78s (code only; Python module loading adds ~40s on first run).
+V26 adds: token pre-fetch before Phase 6 page load, saving ~1-2s of auth
+overhead from the polling path. Uses pyperclip for clipboard (Windows API,
+no subprocess).
+
+Typical execution: ~82s (code only; Python module loading adds ~40s on first run).
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import asyncio
 import json
 import os
 import re
-import subprocess
+import pyperclip
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,13 +140,9 @@ async def get_cdp_page(cdp_url: str):
 # ──────────────────────────── Clipboard ───────────────────────────────────
 
 async def read_system_clipboard() -> str:
-    if os.name == "nt":
-        cmd = ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard -Raw"]
-    else:
-        cmd = ["pbpaste"]
+    # pyperclip uses Windows API directly — faster and more reliable than PowerShell.
     try:
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=15)
-        return (result.stdout or "").strip()
+        return pyperclip.paste()
     except Exception:
         return ""
 
@@ -597,17 +597,21 @@ async def phase3_get_credentials(page, config, app_id: str | None = None) -> tup
 
     await secret_buttons.nth(1).click()
     _tick("[Phase 3] Secret reveal button clicked")
-    await asyncio.sleep(UI_SETTLE_DELAY)
+    await asyncio.sleep(SAVE_SETTLE_DELAY)  # Give Feishu time to write to clipboard
 
     # Primary: read from JS-intercepted clipboard value
     js_captured = await page.evaluate("() => window._clipCapture")
     if js_captured and re.fullmatch(r"[A-Za-z0-9]{32,64}", js_captured):
         app_secret = js_captured
     else:
-        # Fallback: OS clipboard (PowerShell Get-Clipboard)
-        raw_clip = await read_system_clipboard()
-        if raw_clip and re.fullmatch(r"[A-Za-z0-9]{32,64}", raw_clip):
-            app_secret = raw_clip
+        # Fallback: OS clipboard — retry up to 3 times if first read is wrong
+        for attempt in range(3):
+            raw_clip = await read_system_clipboard()
+            if raw_clip and re.fullmatch(r"[A-Za-z0-9]{32,64}", raw_clip):
+                app_secret = raw_clip
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.3)
         else:
             # Last resort: extract from page body text
             text = await body_text(page)
@@ -882,12 +886,26 @@ async def phase6_publish_version(page, config, app_id: str, app_secret: str) -> 
     """
     Phase 6: Create and publish a version.
 
-    Key optimization (V25): API-only publish verification.
-    No UI navigation needed — the Feishu API is authoritative for version status.
-    Runs tenant token + version query in a background thread via asyncio.to_thread,
-    polling every 5s until "published" is seen or 60s timeout.
+    Key optimization (V26): Pre-fetch tenant token before any page navigation.
+    While the version form is being filled, the token is already in hand so
+    polling can start immediately after Publish is clicked — no auth overhead
+    during the critical ~30s wait window.
     """
     _tick("[Phase 6] Publish version starts")
+
+    # ── Pre-fetch token (overlaps with page load + form fill) ──
+    token_req = Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urlopen(token_req, timeout=10) as resp:
+        token_data = json.loads(resp.read())
+    tenant_token = token_data.get("tenant_access_token")
+    if not tenant_token:
+        raise RuntimeError("[Phase 6] Failed to get tenant access token before publish.")
+    _tick("[Phase 6] Token pre-fetched (overlapped with page load)")
 
     await page.goto(console_url(f"/app/{app_id}/version"),
                     wait_until="domcontentloaded", timeout=30000)
@@ -931,21 +949,9 @@ async def phase6_publish_version(page, config, app_id: str, app_secret: str) -> 
     # "published" status. The Feishu API is authoritative — UI state always lags.
     # We run the check in a background thread so the asyncio event loop is not blocked.
 
-    def _sync_check_api() -> bool:
-        """Run auth + version query synchronously in a background thread."""
+    def _check_version() -> bool:
+        """Query version list using the pre-fetched tenant_token."""
         try:
-            token_req = Request(
-                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urlopen(token_req, timeout=10) as resp:
-                token_data = json.loads(resp.read())
-            tenant_token = token_data.get("tenant_access_token")
-            if not tenant_token:
-                _tick("[Phase 6] API: failed to get tenant token")
-                return False
             version_req = Request(
                 f"https://open.feishu.cn/open-apis/application/v6/applications/{app_id}/app_versions?lang=zh_cn&page_size=5",
                 headers={"Authorization": f"Bearer {tenant_token}"},
@@ -970,11 +976,15 @@ async def phase6_publish_version(page, config, app_id: str, app_secret: str) -> 
             _tick(f"[Phase 6] API check failed: {e}")
             return False
 
+    # ── Navigate to version page, fill form, click Publish ──
+    await page.goto(console_url(f"/app/{app_id}/version"),
+                    wait_until="domcontentloaded", timeout=30000)
+
     _tick("[Phase 6] Waiting for Feishu to process publish (API polling)...")
-    # Poll until confirmed or timeout. asyncio.to_thread avoids blocking the event loop.
+    # Poll using the pre-fetched token. asyncio.to_thread avoids blocking the event loop.
     deadline = asyncio.get_running_loop().time() + 60
     while asyncio.get_running_loop().time() < deadline:
-        result = await asyncio.to_thread(_sync_check_api)
+        result = await asyncio.to_thread(_check_version)
         if result:
             _tick("[Phase 6] Version published — confirmed via API")
             return

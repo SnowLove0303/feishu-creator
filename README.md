@@ -1,18 +1,19 @@
-# Feishu App Creation Workflow V25
+# Feishu App Creation Workflow V26
 
-全自动创建、配置、发布飞书（Feishu/Lark）自建应用，通过 Chrome 远程调试会话完成，无需 API Key，全程图形界面操作。**速度优化版本**，在稳定网络和快速机器上典型执行时间约 **84 秒**。
+全自动创建、配置、发布飞书（Feishu/Lark）自建应用，通过 Chrome 远程调试会话完成，无需 API Key，全程图形界面操作。**速度优化版本**，在稳定网络和快速机器上典型执行时间约 **82 秒**。
 
 ---
 
-## V25 与 V24 的区别
+## V26 与 V24 的区别
 
-| 特性 | V24 | V25 |
+| 特性 | V24 | V26 |
 |------|------|-----|
 | 设计目标 | 可靠性优先 | 速度优先（保留可靠性） |
-| 总耗时 | ~77-133s | **~84s** |
+| 总耗时 | ~77-133s | **~82s** |
 | Phase 5 对话框关闭 | `close_confirmation_dialogs`（与"添加"冲突，30s） | `dialog.wait_for("closed")` |
 | Phase 5 订阅模式保存后 | 强制 reload 验证 | 直接验证；reload 仅作 fallback |
 | Phase 6 发布验证 | 顺序等待 30s 后检查 UI | **API 轮询**：后台线程每 5s 查询一次 |
+| Phase 6 Token 获取 | 在轮询循环内（每次轮询重复认证） | **页面加载前预获取** |
 | Phase 2 Bot 等待 | `wait_for_selector("button")` | 显式等待 Bot 卡片加载 |
 | Phase 6 表单填写 | `.fill()`（可能遗漏 React） | `fill_react_control()`（始终正确） |
 | Phase 4 Bot 权限 reload | `reload_and_wait`（等待所有按钮） | `goto` + `UI_SETTLE_DELAY` |
@@ -26,9 +27,11 @@
 
 1. **Phase 5 对话框关闭修复**：解决了 Phase 5 确认事件后 `close_confirmation_dialogs` 与"添加"按钮标签冲突导致的 30s 静默等待
 2. **Phase 5 订阅模式保存后去掉强制 reload**：直接验证当前页面状态，reload 仅作为 fallback，大多数运行走快速路径
-3. **Phase 6 并发验证**：发布后同时运行 API 检查和版本列表页导航，哪个先完成就用哪个
-4. **Phase 6 表单 React 受控输入**：所有表单字段统一使用 `fill_react_control()`
-5. **时间常数收紧**：在保持可靠性的前提下，将各阶段 sleep 值压缩约 40%
+3. **Phase 6 API-only 验证**：发布后通过 Feishu 版本 API 轮询确认发布状态，无需 UI 导航
+4. **Phase 6 Token 预获取**：在页面加载前预先获取 tenant_access_token，轮询时无重复认证开销
+5. **Phase 6 表单 React 受控输入**：所有表单字段统一使用 `fill_react_control()`
+6. **pyperclip 剪贴板**：使用 pyperclip（Windows API）替代 PowerShell subprocess，读取速度更快
+7. **时间常数收紧**：在保持可靠性的前提下，将各阶段 sleep 值压缩约 40%
 
 ---
 
@@ -114,6 +117,7 @@
 → 点击"保存"按钮
 → 点击"确认发布"按钮
 → 关闭确认对话框
+→ 预获取 tenant_access_token（与页面加载并行）
 → API 轮询验证（每 5s 一次，最多 60s）：
   通过 tenant_access_token 调用应用版本 API
   检测到 `status == 1`（已发布）即确认完成
