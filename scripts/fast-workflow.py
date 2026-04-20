@@ -21,6 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 
 _t0 = None
@@ -144,6 +145,9 @@ async def read_system_clipboard() -> str:
         return (result.stdout or "").strip()
     except Exception:
         return ""
+
+
+# (capture_clipboard_via_js removed — logic inlined in phase3_get_credentials)
 
 
 # ──────────────────────────── Core utilities ────────────────────────────────
@@ -578,16 +582,37 @@ async def phase3_get_credentials(page, config, app_id: str | None = None) -> tup
         else:
             raise RuntimeError("App Secret controls not found on the page.")
 
+    # Set up JS clipboard interceptor BEFORE clicking. Feishu calls writeText() synchronously
+    # via Clipboard API, so we wrap it to capture the value before passing through.
+    await page.evaluate("() => { window._clipCapture = null; }")
+    await page.evaluate("""
+        () => {
+            const _orig = navigator.clipboard.writeText.bind(navigator.clipboard);
+            navigator.clipboard.writeText = function(text) {
+                window._clipCapture = text;
+                return _orig(text);
+            };
+        }
+    """)
+
     await secret_buttons.nth(1).click()
     _tick("[Phase 3] Secret reveal button clicked")
     await asyncio.sleep(UI_SETTLE_DELAY)
 
-    app_secret = await read_system_clipboard()
-    if not re.fullmatch(r"[A-Za-z0-9]{32,64}", app_secret or ""):
-        _tick("[Phase 3] Clipboard empty/malformed, extracting from page text...")
-        text = await body_text(page)
-        candidates = re.findall(r"\b[A-Za-z0-9]{32,64}\b", text)
-        app_secret = candidates[-1] if candidates else ""
+    # Primary: read from JS-intercepted clipboard value
+    js_captured = await page.evaluate("() => window._clipCapture")
+    if js_captured and re.fullmatch(r"[A-Za-z0-9]{32,64}", js_captured):
+        app_secret = js_captured
+    else:
+        # Fallback: OS clipboard (PowerShell Get-Clipboard)
+        raw_clip = await read_system_clipboard()
+        if raw_clip and re.fullmatch(r"[A-Za-z0-9]{32,64}", raw_clip):
+            app_secret = raw_clip
+        else:
+            # Last resort: extract from page body text
+            text = await body_text(page)
+            candidates = re.findall(r"\b[A-Za-z0-9]{32,64}\b", text)
+            app_secret = candidates[-1] if candidates else ""
 
     if not re.fullmatch(r"[A-Za-z0-9]{32,64}", app_secret or ""):
         raise RuntimeError("App Secret was not captured correctly (not 32-64 char alphanumeric).")
@@ -857,9 +882,10 @@ async def phase6_publish_version(page, config, app_id: str, app_secret: str) -> 
     """
     Phase 6: Create and publish a version.
 
-    Key optimization (V25): Concurrent API + UI verification.
-    After clicking Publish, run the API check and version list page navigation
-    in parallel via asyncio.gather. This avoids sequential 30s blocking.
+    Key optimization (V25): API-only publish verification.
+    No UI navigation needed — the Feishu API is authoritative for version status.
+    Runs tenant token + version query in a background thread via asyncio.to_thread,
+    polling every 5s until "published" is seen or 60s timeout.
     """
     _tick("[Phase 6] Publish version starts")
 
@@ -895,68 +921,68 @@ async def phase6_publish_version(page, config, app_id: str, app_secret: str) -> 
         if not await click_by_labels(dialog, PUBLISH_LABELS, "button", timeout=5):
             raise RuntimeError("Failed to trigger the publish action.")
     _tick("[Phase 6] Publish button clicked")
+    await asyncio.sleep(SAVE_SETTLE_DELAY)
 
+    # Close any confirmation dialogs that appear after publish
     await close_confirmation_dialogs(page, max_rounds=4)
 
-    # ── Concurrent verification (V25 key optimization) ──
-    # Run API check and UI page load simultaneously.
-    # Feishu takes ~30s internally before the publish state is visible in either path,
-    # but running them in parallel means we only wait once.
+    # ── API-first verification (V25 API-only, no UI navigation) ──
+    # Feishu takes ~30s internally after publish is clicked before the API reflects
+    # "published" status. The Feishu API is authoritative — UI state always lags.
+    # We run the check in a background thread so the asyncio event loop is not blocked.
 
     def _sync_check_api() -> bool:
-        """Synchronous wrapper so asyncio.to_thread can run the API check in a thread."""
-        def _check():
-            try:
-                token_req = Request(
-                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                    data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                with urlopen(token_req, timeout=10) as resp:
-                    token_data = json.loads(resp.read())
-                tenant_token = token_data.get("tenant_access_token")
-                if not tenant_token:
-                    return False
-                version_req = Request(
-                    f"https://open.feishu.cn/open-apis/application/v6/applications/{app_id}/app_versions?lang=zh-CN&page_size=5",
-                    headers={"Authorization": f"Bearer {tenant_token}"},
-                    method="GET"
-                )
-                with urlopen(version_req, timeout=10) as resp:
-                    version_data = json.loads(resp.read())
-                items = (version_data.get("data") or {}).get("items") or []
-                for item in items:
-                    if item.get("status") == "published":
-                        _tick(f"[Phase 6] API confirmed: version '{item.get('version')}' is published")
-                        return True
+        """Run auth + version query synchronously in a background thread."""
+        try:
+            token_req = Request(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urlopen(token_req, timeout=10) as resp:
+                token_data = json.loads(resp.read())
+            tenant_token = token_data.get("tenant_access_token")
+            if not tenant_token:
+                _tick("[Phase 6] API: failed to get tenant token")
                 return False
-            except Exception:
-                return False
-        return _check()
+            version_req = Request(
+                f"https://open.feishu.cn/open-apis/application/v6/applications/{app_id}/app_versions?lang=zh_cn&page_size=5",
+                headers={"Authorization": f"Bearer {tenant_token}"},
+                method="GET"
+            )
+            with urlopen(version_req, timeout=10) as resp:
+                version_data = json.loads(resp.read())
+            items = (version_data.get("data") or {}).get("items") or []
+            for item in items:
+                # Feishu status: 0=draft, 1=published (for self-built apps, publish is instant).
+                status = item.get("status")
+                version_str = item.get("version", "?")
+                if status == 1 or status == "published" or item.get("publish_time"):
+                    _tick(f"[Phase 6] API confirmed: version '{version_str}' is published (status={status})")
+                    return True
+            return False
+        except HTTPError as e:
+            body = e.read().decode(errors="replace")[:200]
+            _tick(f"[Phase 6] API HTTP error {e.code}: {body}")
+            return False
+        except Exception as e:
+            _tick(f"[Phase 6] API check failed: {e}")
+            return False
 
-    async def _check_ui() -> bool:
-        version_list_url = console_url(f"/app/{app_id}/version")
-        # wait_until="commit" — HTML parsed immediately, no JS required
-        await page.goto(version_list_url, wait_until="commit", timeout=15000)
-        return await wait_for_body_contains(page, RELEASED_LABELS, timeout=25, interval=POLL_INTERVAL)
-
-    _tick("[Phase 6] Verifying publish via API + UI concurrently...")
-    api_result, ui_result = await asyncio.gather(
-        asyncio.to_thread(_sync_check_api),
-        _check_ui(),
-    )
-
-    if api_result:
-        _tick("[Phase 6] Version published — confirmed via API")
-        return
-    if ui_result:
-        _tick("[Phase 6] Version published — confirmed via version list page")
-        return
+    _tick("[Phase 6] Waiting for Feishu to process publish (API polling)...")
+    # Poll until confirmed or timeout. asyncio.to_thread avoids blocking the event loop.
+    deadline = asyncio.get_running_loop().time() + 60
+    while asyncio.get_running_loop().time() < deadline:
+        result = await asyncio.to_thread(_sync_check_api)
+        if result:
+            _tick("[Phase 6] Version published — confirmed via API")
+            return
+        await asyncio.sleep(5)  # Feishu takes ~30s; check every 5s
 
     raise RuntimeError(
-        "Neither API nor UI could confirm the version was published. "
-        "The publish may still be in progress or may have failed."
+        "API could not confirm the version was published within 60s. "
+        "The publish may have failed. Check the Feishu console manually."
     )
 
 

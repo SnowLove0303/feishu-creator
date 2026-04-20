@@ -1,6 +1,6 @@
 ---
 name: feishu-app-creation-workflow-v25
-description: Create, configure, and publish Feishu/Lark custom apps through a live Chrome session. Use when Codex needs to automate Feishu developer console work such as creating a custom app, enabling Bot capability, importing permissions JSON, subscribing to events like im.message.receive_v1, retrieving App ID/App Secret, or publishing a version. V25 is the speed-optimized version: concurrent API+UI publish verification, no forced reload in Phase 5, tightened timing constants, and Phase 5 dialog-close fix that eliminated a 30s blocking wait. Typical execution ~78s on stable networks.
+description: Create, configure, and publish Feishu/Lark custom apps through a live Chrome session. Use when Codex needs to automate Feishu developer console work such as creating a custom app, enabling Bot capability, importing permissions JSON, subscribing to events like im.message.receive_v1, retrieving App ID/App Secret, or publishing a version. V25 is the speed-optimized version: API-only publish verification (no UI navigation), no forced reload in Phase 5, tightened timing constants, and Phase 5 dialog-close fix that eliminated a 30s blocking wait. Typical execution ~84s on stable networks.
 ---
 
 # Feishu App Creation Workflow V25
@@ -12,10 +12,10 @@ Use this skill for any Feishu custom app workflow on stable networks and fast ma
 | Feature | V24 | V25 |
 |---------|-----|-----|
 | Design goal | Reliability over speed | Speed with reliability |
-| Total time | ~77-133s | **~78s** |
+| Total time | ~77-133s | **~84s** |
 | Phase 5 close | `close_confirmation_dialogs` (30s conflict) | `dialog.wait_for("closed")` |
 | Phase 5 mode save | Forced reload after every save | Direct verify; reload only as fallback |
-| Phase 6 publish check | Sequential: wait 30s then check UI | **Concurrent**: API + UI in parallel |
+| Phase 6 publish check | Sequential: wait 30s then check UI | **API-only**: poll every 5s, no UI navigation |
 | Phase 2 bot wait | `wait_for_selector("button")` | Explicit Bot card wait |
 | Phase 6 form fill | `.fill()` (may miss React) | `fill_react_control()` (always) |
 | Phase 4 bot reload | `reload_and_wait` (full button wait) | `goto` + `UI_SETTLE_DELAY` |
@@ -28,7 +28,7 @@ Use this skill for any Feishu custom app workflow on stable networks and fast ma
 4. Capture `App ID` and `App Secret`.
 5. Import permissions from JSON.
 6. Configure event subscription to `Persistent Connection` and add the target event.
-7. Create and publish a version — verified concurrently via API and UI.
+7. Create and publish a version — verified by polling the Feishu API (no UI navigation needed).
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ Skips Phase 1 (Create app) and Phase 2 (Add bot).
 | Phase 4 | Import permissions | ~6s |
 | Phase 5 | Subscribe event | ~5s |
 | Phase 6 | Publish version | ~30s (Feishu internal constraint) |
-| **Total** | Full workflow | **~78s** |
+| **Total** | Full workflow | **~84s** |
 
 ## Key Design Decisions
 
@@ -83,18 +83,17 @@ V25 fixes this by using `dialog.wait_for(state="closed", timeout=5)` instead —
 
 After saving the subscription mode, V24 always reloaded the page to verify persistence. V25 verifies directly on the current page first (via `wait_for_body_contains`), only reloading if the mode is not visible. Most runs succeed in the fast path, saving a full page reload + React render cycle.
 
-### Phase 6 concurrent verification (V25 parallelism)
+### Phase 6 API-only publish verification (V25)
 
-Feishu takes ~30s internally after the publish button is clicked before the state is visible in either the API or the UI. V25 runs both checks in parallel:
+Feishu takes ~30s internally after the publish button is clicked before the API reflects the published state. V25 polls the Feishu version API in a background thread every 5s until confirmed or 60s timeout:
 
 ```python
-api_result, ui_result = await asyncio.gather(
-    asyncio.to_thread(_sync_check_api),  # HTTP API in thread
-    _check_ui(),                           # Playwright page navigation
-)
+status = item.get("status")
+if status == 1 or item.get("publish_time"):
+    return True  # confirmed
 ```
 
-When either confirms "published", the workflow completes immediately — no need to wait for the slower path.
+`app_secret` is passed directly from Phase 3 (not re-read from clipboard), which avoids the HTTP 400 bug caused by Phase 4's Monaco clipboard operations overwriting the clipboard. The version API uses `lang=zh_cn` (underscore, not hyphen).
 
 ### React controlled input
 

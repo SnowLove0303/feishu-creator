@@ -1,6 +1,6 @@
 # Feishu App Creation Workflow V25
 
-全自动创建、配置、发布飞书（Feishu/Lark）自建应用，通过 Chrome 远程调试会话完成，无需 API Key，全程图形界面操作。**速度优化版本**，在稳定网络和快速机器上典型执行时间约 **78 秒**。
+全自动创建、配置、发布飞书（Feishu/Lark）自建应用，通过 Chrome 远程调试会话完成，无需 API Key，全程图形界面操作。**速度优化版本**，在稳定网络和快速机器上典型执行时间约 **84 秒**。
 
 ---
 
@@ -9,10 +9,10 @@
 | 特性 | V24 | V25 |
 |------|------|-----|
 | 设计目标 | 可靠性优先 | 速度优先（保留可靠性） |
-| 总耗时 | ~77-133s | **~78s** |
+| 总耗时 | ~77-133s | **~84s** |
 | Phase 5 对话框关闭 | `close_confirmation_dialogs`（与"添加"冲突，30s） | `dialog.wait_for("closed")` |
 | Phase 5 订阅模式保存后 | 强制 reload 验证 | 直接验证；reload 仅作 fallback |
-| Phase 6 发布验证 | 顺序等待 30s 后检查 UI | **并发**：API + UI 同时运行 |
+| Phase 6 发布验证 | 顺序等待 30s 后检查 UI | **API 轮询**：后台线程每 5s 查询一次 |
 | Phase 2 Bot 等待 | `wait_for_selector("button")` | 显式等待 Bot 卡片加载 |
 | Phase 6 表单填写 | `.fill()`（可能遗漏 React） | `fill_react_control()`（始终正确） |
 | Phase 4 Bot 权限 reload | `reload_and_wait`（等待所有按钮） | `goto` + `UI_SETTLE_DELAY` |
@@ -114,10 +114,9 @@
 → 点击"保存"按钮
 → 点击"确认发布"按钮
 → 关闭确认对话框
-→ 并发验证：
-  线程1：Feishu API 获取 tenant_access_token → 查询版本列表
-  页面：goto 版本列表页 → 检查"已发布"文本
-→ 哪个路径先确认"已发布"即完成
+→ API 轮询验证（每 5s 一次，最多 60s）：
+  通过 tenant_access_token 调用应用版本 API
+  检测到 `status == 1`（已发布）即确认完成
 ```
 
 ---
